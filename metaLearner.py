@@ -1,7 +1,8 @@
 # ======================================================
-# ⚡ CF(SVD) + CB(Content-Based) Hybrid Meta-Train Builder
+# CF(SVD) + CB(Content-Based) Hybrid Meta-Train Builder
 #     + XGBoost vs LightGBM vs CatBoost (raw predictions)
 #     + Model-based "similar items" recommender
+#     * Only ranking & display use clipping to [1, 10]
 # ======================================================
 
 """
@@ -22,17 +23,16 @@ This script builds a hybrid recommendation pipeline:
 
 4) Meta-Learners:
    - XGBoost, LightGBM, CatBoost regressors trained to predict true ratings from (cf_score, cb_score).
-   - Evaluation uses raw predictions (no scaling) for RMSE and ranking.
-     * Rationale: the models already learn the 1–10 target distribution; extra scaling can distort rank order.
+   - RMSE evaluation uses raw predictions (no clipping).
 
 5) Ranking Metrics:
-   - Precision@K, Recall@K using raw predictions. A rating ≥ 8.0 is considered "relevant".
+   - Precision@K, Recall@K use predictions clipped to [1, 10] to avoid ranking distortion by overshoot.
+   - A rating ≥ 8.0 is considered "relevant".
 
 6) Model-based Similar Items:
    - Given a target anime title, find users who rated it highly (≥ 8.0), collect their other items,
      infer meta predictions per user-item (using a chosen meta model), average per item, and return Top-N.
-   - For display only, we clip predicted ratings to [1, 10] to avoid overshoot in printed values,
-     but raw predictions are used everywhere else in training/evaluation.
+   - For display only, predicted ratings are clipped to [1, 10]; training/evaluation for RMSE stays raw.
 
 Data Inputs
 -----------
@@ -43,45 +43,25 @@ Data Inputs
 
 Key Design Choices
 ------------------
-- CB profile uses only Top-K neighbors per liked item before averaging:
-  This reduces popularity bleed and focuses the profile on sharp, strongest signals.
-
-- Raw predictions for RMSE/Ranking:
-  Tree ensembles (especially LGBM/CatBoost) naturally calibrate to the target range;
-  extra min-max scaling can worsen RMSE and distort rank order.
+- CB profile uses only Top-K neighbors per liked item before averaging.
+- RMSE uses raw predictions; ranking and display use clipped predictions.
 
 Hyperparameters (Meta-Learners)
 -------------------------------
 XGBoost:
-- n_estimators=300: moderate number of trees (increase for potentially lower bias).
-- learning_rate=0.05: smaller step for smoother function; balances bias/variance.
-- max_depth=6: controls leaf complexity; deeper trees risk overfitting and overshoot.
-- subsample=0.8, colsample_bytree=0.8: stochasticity for regularization.
-- objective="reg:squarederror": standard L2 regression for RMSE optimization.
-- tree_method="hist": faster histogram-based construction.
+- n_estimators=300, learning_rate=0.05, max_depth=6
+- subsample=0.8, colsample_bytree=0.8
+- objective="reg:squarederror", tree_method="hist"
 
 LightGBM:
-- n_estimators=400, learning_rate=0.03: slightly more trees with smaller steps.
-- max_depth=-1: let LightGBM decide best depth (use with care; regularized by subsampling).
-- subsample=0.9, colsample_bytree=0.9: robust generalization via sampling.
-- objective="regression": L2 loss (RMSE).
+- n_estimators=400, learning_rate=0.03, max_depth=-1
+- subsample=0.9, colsample_bytree=0.9
+- objective="regression"
 
 CatBoost:
-- iterations=500, learning_rate=0.03, depth=6: balanced capacity and step size.
-- l2_leaf_reg=8.0: stronger L2 regularization to reduce overshoot.
-- bagging_temperature=0.5: moderate Bayesian bagging strength.
-- random_strength=2.0: random noise in splits to improve generalization.
-
-Metrics
--------
-- RMSE on validation split (raw predictions).
-- Precision@10 / Recall@10 averaged across users with ≥1 relevant item (rating ≥ 8.0).
-
-Notes
------
-- If you observe consistent overshoot (>10) in raw predictions, tighten regularization
-  (e.g., increase L2, reduce max_depth or learning_rate) rather than post-scaling,
-  to preserve rank ordering quality.
+- iterations=500, learning_rate=0.03, depth=6
+- l2_leaf_reg=8.0, bagging_temperature=0.5, random_strength=2.0
+- loss_function="RMSE", verbose=0
 """
 
 import pandas as pd
@@ -108,7 +88,7 @@ meta = meta.fillna(0.0)
 ratings_train = ratings_train[ratings_train['rating'] > 0]
 ratings_test = ratings_test[ratings_test['rating'] > 0]
 
-print(f"✅ Train: {ratings_train.shape}, Test: {ratings_test.shape}\n")
+print(f"Train: {ratings_train.shape}, Test: {ratings_test.shape}\n")
 
 # ------------------------------------------------------
 # 2) CF (Surprise SVD)
@@ -118,15 +98,15 @@ data = Dataset.load_from_df(ratings_train[['user_id', 'anime_id', 'rating']], re
 trainset = data.build_full_trainset()
 
 svd = SVD(
-    n_factors=100,    # latent dimension
-    n_epochs=20,      # training epochs
-    lr_all=0.005,     # learning rate for biases and factors
-    reg_all=0.02,     # L2 regularization for biases and factors
+    n_factors=100,
+    n_epochs=20,
+    lr_all=0.005,
+    reg_all=0.02,
     random_state=42,
     verbose=True
 )
 svd.fit(trainset)
-print("🎯 CF (SVD) training done!\n")
+print("CF (SVD) training done!\n")
 
 # ------------------------------------------------------
 # 3) Content Features & Item-Item Similarity
@@ -138,9 +118,9 @@ X = scaler.fit_transform(meta[feature_cols].values)
 malid_to_idx = {aid: i for i, aid in enumerate(meta['MAL_ID'].values)}
 idx_to_malid = {v: k for k, v in malid_to_idx.items()}
 
-print("🧮 Computing full item-item cosine similarity...")
+print("Computing full item-item cosine similarity...")
 item_sim_matrix = cosine_similarity(X)  # shape: (n_items, n_items)
-print("✅ Item similarity matrix ready!\n")
+print("Item similarity matrix ready!\n")
 
 # ------------------------------------------------------
 # 4) CF Score Helper
@@ -193,7 +173,7 @@ all_users = ratings_train['user_id'].unique()
 sample_users = np.random.choice(all_users, size=min(3000, len(all_users)), replace=False)
 
 meta_train_records: list[tuple[int, int, float, float, float]] = []
-print(f"👥 Sampling {len(sample_users)} / {len(all_users)} users for CB computation\n")
+print(f"Sampling {len(sample_users)} / {len(all_users)} users for CB computation\n")
 
 for uid in tqdm(sample_users, desc="Building Meta-Train"):
     user_data = ratings_train[ratings_train['user_id'] == uid]
@@ -217,10 +197,11 @@ meta_train_df = pd.DataFrame(
 # 7) Save Meta-Train
 # ------------------------------------------------------
 meta_train_df.to_csv("meta_train_ready.csv", index=False)
-print("\n💾 Saved meta_train_ready.csv")
+print("\nSaved meta_train_ready.csv")
 print(meta_train_df.head())
-print(f"\n📊 Meta-Train built: {meta_train_df.shape[0]} samples")
+print(f"\nMeta-Train built: {meta_train_df.shape[0]} samples")
 print(meta_train_df.describe())
+
 
 # ======================================================
 # 8) Meta-Learners: XGB vs LGB vs Cat (raw predictions)
@@ -269,23 +250,23 @@ cat_model = CatBoostRegressor(
     random_seed=42
 )
 
-print("\n🎯 Training XGBoost...")
+print("\nTraining XGBoost...")
 xgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
-print("✅ XGBoost done!")
+print("XGBoost done!")
 
-print("🎯 Training LightGBM...")
+print("Training LightGBM...")
 lgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.log_evaluation(0)])
-print("✅ LightGBM done!")
+print("LightGBM done!")
 
-print("🎯 Training CatBoost...")
+print("Training CatBoost...")
 cat_model.fit(X_train, y_train, eval_set=(X_val, y_val))
-print("✅ CatBoost done!\n")
+print("CatBoost done!\n")
 
 # ------------------------------------------------------
-# 9) RMSE (raw predictions) and P@10 / R@10 (raw)
+# 9) RMSE (raw predictions) and P@10 / R@10 (CLIPPED for ranking)
 # ------------------------------------------------------
 def rmse(model, Xv, yv) -> float:
-    pred = model.predict(Xv)
+    pred = model.predict(Xv)                 # RAW for RMSE
     return float(np.sqrt(mean_squared_error(yv, pred)))
 
 xgb_rmse = rmse(xgb_model, X_val, y_val)
@@ -298,12 +279,13 @@ K = 10
 def precision_recall_at_k(model, df: pd.DataFrame, k: int = 10, like_th: float = 8.0):
     """
     Compute mean Precision@K and Recall@K across users with at least one relevant item.
-    Uses raw predictions for ranking (no scaling).
+    Uses predictions CLIPPED to [1, 10] for ranking to avoid overshoot-driven distortions.
     """
     precisions, recalls = [], []
     for uid, group in df.groupby("user_id"):
         g = group.copy()
-        g["meta_pred"] = model.predict(g[["cf_score", "cb_score"]])
+        raw_pred = model.predict(g[["cf_score", "cb_score"]])
+        g["meta_pred"] = np.clip(raw_pred, 1.0, 10.0)   # CLIPPED for ranking
         topk = g.sort_values("meta_pred", ascending=False).head(k)
         relevant = g[g["true_rating"] >= like_th]
         if len(relevant) == 0:
@@ -317,30 +299,39 @@ xgb_prec, xgb_rec, n_users = precision_recall_at_k(xgb_model, meta_df, K, LIKE_T
 lgb_prec, lgb_rec, _ = precision_recall_at_k(lgb_model, meta_df, K, LIKE_TH)
 cat_prec, cat_rec, _ = precision_recall_at_k(cat_model, meta_df, K, LIKE_TH)
 
-print("\n📊 Model Performance Comparison (Raw Predictions)\n")
+print("\nModel Performance Comparison")
+print("(RMSE uses RAW predictions; Precision/Recall use CLIPPED predictions [1,10])\n")
 print(f"{'Model':<12} | {'RMSE(raw)':<10} | {'Precision@10':<13} | {'Recall@10':<10}")
 print("-" * 65)
 print(f"{'XGBoost':<12} | {xgb_rmse:<10.4f} | {xgb_prec:<13.4f} | {xgb_rec:<10.4f}")
 print(f"{'LightGBM':<12} | {lgb_rmse:<10.4f} | {lgb_prec:<13.4f} | {lgb_rec:<10.4f}")
 print(f"{'CatBoost':<12} | {cat_rmse:<10.4f} | {cat_prec:<13.4f} | {cat_rec:<10.4f}")
 print("-" * 65)
-print(f"👥 Users evaluated: {n_users}")
+print(f"Users evaluated: {n_users}")
 
 winner = min(
     [("XGBoost", xgb_rmse), ("LightGBM", lgb_rmse), ("CatBoost", cat_rmse)],
     key=lambda x: x[1]
 )[0]
-print(f"\n🏆 Lowest RMSE model: {winner}\n")
+print(f"\nLowest RMSE model: {winner}\n")
 
 # ------------------------------------------------------
-# 10) Side-by-side Top-10 for a Sample User (raw)
+# 10) Side-by-side Top-10 for a Sample User
+#       - Sort by RAW predictions (unchanged)
+#       - Display CLIPPED values in print only
 # ------------------------------------------------------
 sample_user = meta_df["user_id"].sample(1, random_state=42).iloc[0]
 user_data = meta_df[meta_df["user_id"] == sample_user].copy()
 
-user_data["xgb_pred"] = xgb_model.predict(user_data[["cf_score", "cb_score"]])
-user_data["lgb_pred"] = lgb_model.predict(user_data[["cf_score", "cb_score"]])
-user_data["cat_pred"] = cat_model.predict(user_data[["cf_score", "cb_score"]])
+# RAW predictions for sorting
+user_data["xgb_pred_raw"] = xgb_model.predict(user_data[["cf_score", "cb_score"]])
+user_data["lgb_pred_raw"] = lgb_model.predict(user_data[["cf_score", "cb_score"]])
+user_data["cat_pred_raw"] = cat_model.predict(user_data[["cf_score", "cb_score"]])
+
+# CLIPPED for display
+user_data["xgb_pred_disp"] = np.clip(user_data["xgb_pred_raw"], 1.0, 10.0)
+user_data["lgb_pred_disp"] = np.clip(user_data["lgb_pred_raw"], 1.0, 10.0)
+user_data["cat_pred_disp"] = np.clip(user_data["cat_pred_raw"], 1.0, 10.0)
 
 user_data = user_data.merge(
     anime_info[["MAL_ID", "Name"]],
@@ -349,21 +340,23 @@ user_data = user_data.merge(
     how="left"
 )
 
-top10_xgb = user_data.sort_values("xgb_pred", ascending=False).head(10)
-top10_lgb = user_data.sort_values("lgb_pred", ascending=False).head(10)
-top10_cat = user_data.sort_values("cat_pred", ascending=False).head(10)
+top10_xgb = user_data.sort_values("xgb_pred_raw", ascending=False).head(10)
+top10_lgb = user_data.sort_values("lgb_pred_raw", ascending=False).head(10)
+top10_cat = user_data.sort_values("cat_pred_raw", ascending=False).head(10)
 
-print(f"🎯 User {sample_user} — Top-10 by three models (No Scaling)\n{'-'*120}")
+print(f"User {sample_user} — Top-10 by three models")
+print("(Sorted by RAW predictions; values displayed are CLIPPED to [1,10])\n" + "-"*120)
 print(f"{'XGBoost Top':<38} | {'pred/true':<10} || {'LightGBM Top':<38} | {'pred/true':<10} || {'CatBoost Top':<38} | {'pred/true'}")
 print("-"*120)
 for i in range(10):
-    nx, px, tx = top10_xgb.iloc[i]["Name"], top10_xgb.iloc[i]["xgb_pred"], top10_xgb.iloc[i]["true_rating"]
-    nl, pl, tl = top10_lgb.iloc[i]["Name"], top10_lgb.iloc[i]["lgb_pred"], top10_lgb.iloc[i]["true_rating"]
-    nc, pc, tc = top10_cat.iloc[i]["Name"], top10_cat.iloc[i]["cat_pred"], top10_cat.iloc[i]["true_rating"]
+    nx, px, tx = top10_xgb.iloc[i]["Name"], top10_xgb.iloc[i]["xgb_pred_disp"], top10_xgb.iloc[i]["true_rating"]
+    nl, pl, tl = top10_lgb.iloc[i]["Name"], top10_lgb.iloc[i]["lgb_pred_disp"], top10_lgb.iloc[i]["true_rating"]
+    nc, pc, tc = top10_cat.iloc[i]["Name"], top10_cat.iloc[i]["cat_pred_disp"], top10_cat.iloc[i]["true_rating"]
     print(f"{nx[:36]:<38} | {px:>4.2f}/{tx:<4.1f} || {nl[:36]:<38} | {pl:>4.2f}/{tl:<4.1f} || {nc[:36]:<38} | {pc:>4.2f}/{tc:<4.1f}")
 
 # ======================================================
 # 11) Model-based "Similar Items" Recommender (by Meta model)
+#       - Display uses CLIPPED predictions
 # ======================================================
 def recommend_similar_by_model(
     target_title: str,
@@ -382,7 +375,7 @@ def recommend_similar_by_model(
     4) Merge with meta features (cf_score, cb_score); predict meta rating with `meta_model`.
     5) Average predictions per item and return top-N.
     Notes:
-    - We clip predictions only for display (1..10), not for training/evaluation elsewhere.
+    - Predictions are CLIPPED to [1, 10] for display only.
     """
     anime_df = pd.read_csv("anime.csv")
     ratings_df = pd.read_csv("rating_complete.csv")
@@ -391,16 +384,16 @@ def recommend_similar_by_model(
     # 1) Target item lookup
     match = anime_df[anime_df["Name"].str.contains(target_title, case=False, na=False)]
     if match.empty:
-        print(f"❌ Title '{target_title}' not found.")
+        print(f"Title '{target_title}' not found.")
         return
     target_id = match.iloc[0]["MAL_ID"]
     target_name = match.iloc[0]["Name"]
-    print(f"\n🎯 Recommendations conditioned on '{target_name}' (MAL_ID={target_id})\n")
+    print(f"\nRecommendations conditioned on '{target_name}' (MAL_ID={target_id})\n")
 
     # 2) Users who liked target
     liked_users = ratings_df[(ratings_df["anime_id"] == target_id) & (ratings_df["rating"] >= like_th)]["user_id"].unique()
     if len(liked_users) == 0:
-        print("❌ No users liked the target item.")
+        print("No users liked the target item.")
         return
 
     # 3) Candidate (user, item) among those users excluding target
@@ -415,7 +408,7 @@ def recommend_similar_by_model(
         how="left"
     ).dropna(subset=["cf_score", "cb_score"])
     if merged.empty:
-        print("❌ No candidates with available CF/CB scores.")
+        print("No candidates with available CF/CB scores.")
         return
 
     preds = meta_model.predict(merged[["cf_score", "cb_score"]])
@@ -430,7 +423,7 @@ def recommend_similar_by_model(
     )
     item_scores = item_scores[item_scores["anime_id"] != target_id].head(top_n)
 
-    print(f"📺 Items users who liked '{target_name}' are also likely to like — Top-{top_n} ({model_name})")
+    print(f"Items users who liked '{target_name}' are also likely to like — Top-{top_n} ({model_name})")
     print("-" * 100)
     for _, row in item_scores.iterrows():
         print(f"{row['Name']:<70} | Predicted: {row['meta_pred']:.2f}")
