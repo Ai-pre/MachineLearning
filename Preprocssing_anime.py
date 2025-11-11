@@ -1,4 +1,94 @@
 # ============================================
+# 0. Data Inspection (anime.csv / rating_complete.csv)
+# ============================================
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# -----------------------------
+# 1. Load Datasets
+# -----------------------------
+ANIME_PATH = "anime.csv"
+RATING_PATH = "rating_complete.csv"
+anime_df = pd.read_csv(ANIME_PATH)
+rating_df = pd.read_csv(RATING_PATH)
+print(f"Loaded anime.csv: {anime_df.shape}")
+print(f"Loaded rating_complete.csv: {rating_df.shape}")
+
+# -----------------------------
+# 2. Basic Overview
+# -----------------------------
+print("\n====================================")
+print("Anime.csv Overview")
+print("====================================")
+print("\nAnime Columns:")
+print(anime_df.columns.tolist())
+print("\nAnime Data Sample:")
+print(anime_df.head())
+print("\nAnime Info:")
+print(anime_df.info())
+
+# -----------------------------
+# 3. Missing Value Check
+# -----------------------------
+missing_ratio = anime_df.isnull().mean().sort_values(ascending=False)
+if (missing_ratio == 0).all():
+    print("\nNo missing values found in anime.csv.")
+else:
+    print("\nMissing Values (Top 10):")
+    print(missing_ratio.head(10))
+    
+# -----------------------------
+# 4. Anime Statistics
+# -----------------------------
+print("\nNumeric Summary:")
+print(anime_df.describe())
+print("\nAnime Type Distribution:")
+print(anime_df['Type'].value_counts())
+print("\nRating Category Distribution:")
+print(anime_df['Rating'].value_counts())
+
+# -----------------------------
+# 5. Rating Dataset Overview
+# -----------------------------
+print("\n====================================")
+print("rating_complete.csv Overview")
+print("====================================")
+print("\nRating Columns:")
+print(rating_df.columns.tolist())
+print("\nRating Data Sample:")
+print(rating_df.head())
+print("\nRating Info:")
+print(rating_df.info())
+# Unique users and items
+num_users = rating_df['user_id'].nunique()
+num_anime = rating_df['anime_id'].nunique()
+print(f"\nUnique Users: {num_users}")
+print(f"Unique Anime: {num_anime}")
+# Rating distribution
+print("\nRating Distribution:")
+print(rating_df['rating'].value_counts().sort_index())
+# Count rating == 0 (unrated entries)
+zero_count = (rating_df['rating'] == 0).sum()
+print(f"\nUnrated (rating=0): {zero_count} / {len(rating_df)}")
+
+# -----------------------------
+# 6. Optional Visualizations
+# -----------------------------
+# Rating distribution
+plt.figure(figsize=(6,4))
+sns.countplot(x='rating', data=rating_df, color='steelblue')
+plt.title("Rating Distribution (rating_complete.csv)")
+plt.xlabel("Rating")
+plt.ylabel("Count")
+plt.show()
+# Anime type distribution
+plt.figure(figsize=(8,4))
+sns.countplot(y='Type', data=anime_df, order=anime_df['Type'].value_counts().index, color='coral')
+plt.title("Anime Type Distribution")
+plt.show()
+
+# ============================================
 #   meta_preprocessed.csv Builder
 #   → Content-Based Features for Hybrid Recommender
 #   Includes: TF-IDF (Genres/Producers/Studios),
