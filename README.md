@@ -1,4 +1,7 @@
-# 🎬 Animation Recommendation System
+# 🎬 Animation Recommendation System  
+
+### Train dataset : https://www.kaggle.com/datasets/hernan4444/anime-recommendation-database-2020  
+### Test dataset : https://www.kaggle.com/datasets/CooperUnion/anime-recommendations-database/data
 
 ## 📊 Data Inspection
 
